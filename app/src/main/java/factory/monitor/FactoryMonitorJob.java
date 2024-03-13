@@ -9,9 +9,11 @@ import factory.monitor.map.JsonMapFunction;
 import factory.monitor.model.SensorReading;
 import factory.monitor.process.AvgStdSensorProcessFunction;
 import factory.monitor.process.LowPressureProcessFunction;
+import factory.monitor.process.SendSlackMessageAsyncFunction;
 import factory.monitor.process.TrackHeaterStateProcessFunction;
 import factory.monitor.serde.SensorReadingDeserializationSchema;
 import factory.monitor.windows.SensorMetricProcessWindowFunction;
+import factory.monitor.windows.SlackMessageAggregateFunction;
 import org.apache.commons.cli.*;
 import org.apache.flink.api.common.eventtime.SerializableTimestampAssigner;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
@@ -25,12 +27,14 @@ import org.apache.flink.connector.kafka.sink.KafkaSinkBuilder;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.datastream.AsyncDataStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
-import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,6 +45,7 @@ import java.net.URISyntaxException;
 import java.time.Duration;
 import java.time.ZoneOffset;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 
 public class FactoryMonitorJob {
 
@@ -55,6 +60,9 @@ public class FactoryMonitorJob {
     final AppConfig appConfig = loadAppConfig(args);
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     KafkaSource<SensorReading> kafkaSource = constructKafkaSource(appConfig.kafkaSourceConfig);
+
+    env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+    env.getCheckpointConfig().setCheckpointInterval(60_000);
 
     DataStreamSource<SensorReading> sensorReadings = env.fromSource(
       kafkaSource,
@@ -75,11 +83,6 @@ public class FactoryMonitorJob {
       .name("temperature-readings")
       .uid("temperature-readings");
 
-    DataStream<SensorReading> boilerTemperatureReadings = temperatureReadings
-      .filter((FilterFunction<SensorReading>) reading -> reading.entityId.contains("boiler_temperature"))
-      .name("boiler-temperature-readings")
-      .uid("broiler-temperature-readings");
-
     DataStream<SensorReading> pressureReadings = sensorReadings
       .filter((FilterFunction<SensorReading>) reading -> reading.state.deviceClass.equalsIgnoreCase("pressure"))
       .name("pressure-readings")
@@ -97,7 +100,7 @@ public class FactoryMonitorJob {
 
     // Union together temperature, pressure, and flow readings, create windows of x elements,
     // then emit the avg & std values for each sensor entity
-    temperatureReadings
+    DataStream<String> avgStdMetricsJson = temperatureReadings
       .union(pressureReadings)
       .union(flowReadings)
       .keyBy((KeySelector<SensorReading, String>) reading -> reading.entityId)
@@ -106,12 +109,14 @@ public class FactoryMonitorJob {
       .uid("avg-std-metrics")
       .map(new JsonMapFunction<>())
       .name("avg-std-metrics-json")
-      .uid("avg-std-metrics-json")
+      .uid("avg-std-metrics-json");
+
+    avgStdMetricsJson
       .sinkTo(constructKafkaSink(appConfig.kafkaSinkConfig, appConfig.kafkaSinkConfig.avgStdMetricsTopic));
 
     // Union together heater and temperature readings, when the heater turns on send the current temperature for
     // all the temperature sensors.
-    heaterReadings
+    DataStream<String> temperatureReadingsJson =  heaterReadings
       .union(temperatureReadings)
       .keyBy(new NullByteKeySelector<>())
       .process(new TrackHeaterStateProcessFunction())
@@ -119,13 +124,13 @@ public class FactoryMonitorJob {
       .uid("temperature-readings-when-boiler-turns-on")
       .map(new JsonMapFunction<>())
       .name("temperature-readings-when-boiler-turns-on-json")
-      .uid("temperature-readings-when-boiler-turns-on-json")
+      .uid("temperature-readings-when-boiler-turns-on-json");
+
+    temperatureReadingsJson
       .sinkTo(constructKafkaSink(appConfig.kafkaSinkConfig, appConfig.kafkaSinkConfig.temperatureReadingsTopic));
 
-    // Union together heater and broiler temperature readings, when the heater turns on open session and calculate
-
     // Get the sliding average of CO2 emissions within a 5-minute period
-    co2Readings
+    DataStream<String> co2EmissionsJson = co2Readings
       .keyBy((KeySelector<SensorReading, String>) reading -> reading.entityId)
       .window(SlidingEventTimeWindows.of(Time.minutes(5), Time.minutes(1)))
       .allowedLateness(Time.minutes(1))
@@ -134,19 +139,42 @@ public class FactoryMonitorJob {
       .name("co2-sensor-metrics")
       .map(new JsonMapFunction<>())
       .name("co2-sensor-metrics-json")
-      .name("co2-sensor-metrics-json")
+      .name("co2-sensor-metrics-json");
+
+    co2EmissionsJson
       .sinkTo(constructKafkaSink(appConfig.kafkaSinkConfig, appConfig.kafkaSinkConfig.co2EmissionsTopic));
 
     // Check all the pressure readings, if they dip below 10 for 3 minutes, then trigger an alert
-    pressureReadings
+    DataStream<String> lowPressureAlerts = pressureReadings
       .keyBy((KeySelector<SensorReading, String>) reading -> reading.entityId)
       .process(new LowPressureProcessFunction(10.0, Time.minutes(10).toMilliseconds()))
       .name("low-pressure-alerts")
       .name("low-pressure-alerts")
       .map(new JsonMapFunction<>())
       .name("low-pressure-alerts-json")
-      .name("low-pressure-alerts-json")
+      .name("low-pressure-alerts-json");
+
+    lowPressureAlerts
       .sinkTo(constructKafkaSink(appConfig.kafkaSinkConfig, appConfig.kafkaSinkConfig.lowPressureTopic));
+
+    if (appConfig.slackConfig.url != null) {
+      // Combine our alerts going to slack into a single string for a single minute in processing time
+      DataStream<String> aggregatedMessagesForSlack = avgStdMetricsJson
+        .union(temperatureReadingsJson)
+        .union(co2EmissionsJson)
+        .union(lowPressureAlerts)
+        .windowAll(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+        .aggregate(new SlackMessageAggregateFunction());
+
+      // Create an async data stream to send our messages to Slack
+      AsyncDataStream.orderedWait(
+        aggregatedMessagesForSlack,
+        new SendSlackMessageAsyncFunction(appConfig.slackConfig.url),
+        30,
+        TimeUnit.SECONDS
+      );
+    }
+
 
     env.execute("Factory Monitor Job");
   }
@@ -173,11 +201,10 @@ public class FactoryMonitorJob {
         return AppConfig.fromConfig(ConfigFactory.parseReader(reader));
       }
 
-      return AppConfig.fromConfig(ConfigFactory.parseFile(new File(new URI(cmd.getOptionValue("config")))));
-    } catch (ParseException | URISyntaxException | RuntimeException e) {
+      return AppConfig.fromConfig(ConfigFactory.parseFile(new File(cmd.getOptionValue("config"))));
+    } catch (ParseException | RuntimeException e) {
       LOGGER.error("Could not parse command line arguments");
       LOGGER.error(e.getMessage());
-      System.exit(1);
       throw new RuntimeException(e);
     }
   }
@@ -190,7 +217,7 @@ public class FactoryMonitorJob {
       .setBootstrapServers(kafkaSourceConfig.bootstrapServers)
       .setTopics(kafkaSourceConfig.topic)
       .setProperties(properties)
-      .setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
+      .setStartingOffsets(OffsetsInitializer.earliest())
       .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(new SensorReadingDeserializationSchema()))
       .build();
   }

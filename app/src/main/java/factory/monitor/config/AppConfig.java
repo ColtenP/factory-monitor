@@ -85,7 +85,7 @@ public class AppConfig {
 
     public static SlackConfig fromConfig(Config config) {
       return new SlackConfig(
-        config.getString("url")
+        config.hasPath("url") ? config.getString("url") : null
       );
     }
   }
