@@ -30,6 +30,7 @@ dependencies {
     implementation("com.typesafe:config:1.4.3")
 
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
+    implementation("org.apache.httpcomponents.client5:httpclient5-fluent:5.3.1")
 
 
     implementation("org.apache.flink:flink-streaming-java:1.18.1")
